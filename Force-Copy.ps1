@@ -319,7 +319,7 @@ $DestinationFile.CreationTimeUtc = $SourceFile.CreationTimeUtc;
 $DestinationFile.LastWriteTimeUtc = $SourceFile.LastWriteTimeUtc;
 $DestinationFile.IsReadOnly = $SourceFile.IsReadOnly;
 
-Write-Host "Finished copying $SourceFilePath!" -ForegroundColor "Green";
+Write-Host "Finished copying $SourceFilePath!`n" -ForegroundColor "Green";
 
 # Return specific code.
 if ($UnreadableBlocks) {
