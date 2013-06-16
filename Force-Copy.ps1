@@ -48,10 +48,6 @@ param(
 			  HelpMessage="Destination file path.")]
    [string][ValidateScript({Test-Path -LiteralPath $_ -IsValid})]$DestinationFilePath,
    [Parameter(Mandatory=$false,
-			  ValueFromPipeline=$true,
-			  HelpMessage="Path to the allready copied file with bad blocks.")]
-   [string][ValidateScript({(Test-Path -LiteralPath $_)})]$PartialFilePath,
-   [Parameter(Mandatory=$false,
 			  ValueFromPipeline=$false,
 			  HelpMessage="Buffer size in bytes.")]
    [int32]$BufferSize=512*2*2*2, # 4096: the default windows cluster size.
@@ -66,18 +62,18 @@ param(
    [Parameter(Mandatory=$false,
 			  ValueFromPipeline=$true,
 			  HelpMessage="Specify position from which to read block.")]
-   [int64]$Position=0,
+   [int64]$Position=0, # must be 0, current limitation
    [Parameter(Mandatory=$false,
 			  ValueFromPipeline=$true,
 			  HelpMessage="Specify end position for reading.")]
-   [int64]$PositionEnd=-1,
+   [int64]$PositionEnd=-1, # must be -1, current limitation
    [Parameter(Mandatory=$false,
 			  ValueFromPipeline=$false,
 			  HelpMessage="Ignore the existing badblocks.xml file?")]
    [switch]$IgnoreBadBlocksFile=$false
 )
 
-# Set-StrictMode -Version 2;
+Set-StrictMode -Version 2;
 
 # Simple assert function from http://poshcode.org/1942
 function Assert {
@@ -202,6 +198,10 @@ if ((Test-Path -LiteralPath $DestinationFilePath) -and -not $Overwrite) {
 	Write-Host "Destination file $DestinationFilePath allready exists and -Overwrite not specified. Exiting." -ForegroundColor "Red";
 	exit 2;
 }
+Assert {$Position -eq 0 -and $PositionEnd -eq -1} "Current limitation: Position and POsitionEnd should be 0 and -1 respectively.";
+
+# Setting global variables
+$DestinationFileBadBlocksPath = $DestinationFilePath + '.badblocks.xml';
 
 # Fetching SOURCE file
 $SourceFile = Get-Item -LiteralPath $SourceFilePath;
@@ -212,44 +212,32 @@ if (-not (Test-Path -LiteralPath ($DestinationParentFilePath = Split-Path -Path 
 	New-Item -ItemType Directory -Path $DestinationParentFilePath | Out-Null;
 }
 $DestinationFile = New-Object System.IO.FileInfo ($DestinationFilePath); # Does not (!) physicaly make a file.
+
+# Special handling for DESTINATION file in case OVERWRITE is used! Only bad block are read from source!
 if ($Overwrite -and (Test-Path -LiteralPath $DestinationFilePath)) {
-	Assert {$SourceFile.Length -eq $DestinationFile.Length} "Source and destination file have not the same size!"  # Make sure the Source and Destination files have the same length prior to overwrite!
 	
-	if (-not $IgnoreBadBlocksFile) {
-		# Search for badblocks.xml - if it doesn't exist then the file is probably OK, so don't do anything!
-		if (-not (Test-Path ($DestinationFileBadBlocksPath = $DestinationFile.DirectoryName + '\' + $DestinationFile.Name + '.badblocks.xml'))) {
-			Write-Host "Destination file $DestinationFilePath has no bad blocks. It is unwise to continue... Exiting." -ForegroundColor "Red";
+	# Make sure the Source and Destination files have the same length prior to overwrite!
+	Assert {$SourceFile.Length -eq $DestinationFile.Length} "Source and destination file have not the same size!"  
+	
+	# Search for badblocks.xml - if it doesn't exist then the file is probably OK, so don't do anything!
+	if (-not (Test-Path -LiteralPath $DestinationFileBadBlocksPath)) {
+	
+		Write-Host "Destination file $DestinationFilePath has no bad blocks. It is unwise to continue... Exiting." -ForegroundColor "Red";
+		exit 3;
+
+	} else { # There is a $DestinationFileBadBlocksPath
+		
+		$DestinationFileBadBlocks = Import-Clixml $DestinationFileBadBlocksPath;
+		Write-Host "Badblocks.xml successfully imported. Destination file has $(($DestinationFileBadBlocks | Measure-Object -Sum -Property Size).Sum) bad bytes." -ForegroundColor "Yellow";
+		
+		# Make sure destination file has bad blocks.
+		if ($DestinationFileBadBlocksPath.Length -eq 0) {
+			Write-Host "Destination file $DestinationFilePath has no bad blocks according to badblocks.xml. Should not overwrite... Exiting." -ForegroundColor "Red";
 			exit 3;
-		} else { # There is a $DestinationFileBadBlocksPath
-			$DestinationFileBadBlocks = Import-Clixml $DestinationFileBadBlocksPath;
+		}	
+	
+		Assert {($DestinationFileBadBlocks | Measure-Object -Average -Property Size).Average -eq $BufferSize } "Block sizes do not match between source and destination file. Can not continue." # This is currently an implementation shortcomming.
 			
-			# Make sure destination file has bad blocks.
-			if ($DestinationFileBadBlocksPath.Length -eq 0) {
-				Write-Host "Destination file $DestinationFilePath has no bad blocks according to badblocks.xml. Should not overwrite... Exiting." -ForegroundColor "Red";
-				exit 3;
-			}
-			
-			foreach ($BadBlock in $DestinationFileBadBlocks) {
-				powershell -File """$($myinvocation.MyCommand.Definition)""" -SourceFilePath """$($SourceFilePath)""" -DestinationFilePath """$($DestinationFilePath)""" -Position $BadBlock.Offset -PositionEnd ($BadBlock.Offset + $BadBlock.Size) -Overwrite -IgnoreBadBlocksFile;
-				# ...
-				# Concept is niet zo goed... Wat als al dit hier gedaan is, verder executen, en hoe??
-			}
-			
-		}
-	}
-}
-
-# Fetching PARTIAL file.
-if ($PartialFilePath) {$PartialFile = Get-Item -LiteralPath $PartialFilePath; Assert {$SourceFile.Length -eq $PartialFile.Length} "Source and partial file have not the same size!";}
-
-# Fetching badblocks.xml from $PartialFile
-if ($PartialFilePath) {
-	if (Test-Path ($PartialFile.DirectoryName + '\' + $PartialFile.BaseName + '.badblocks.xml')) {
-		$PartialFileBadBlocks = Import-Clixml -Path ($PartialFile.DirectoryName + '\' + $PartialFile.BaseName + '.badblocks.xml');
-		Write-Host "Badblocks.xml successfully imported." -ForegroundColor "Green";
-		Assert {($PartialFileBadBlocks | Measure-Object -Average -Property Size).Average -eq $BufferSize } "Block sizes do not match between source and partial file. Can not continue." # This is currently an implementation shortcomming.
-	} else {
-		Write-Host "Partial file specified, but no badblocks.xml exists: partial file will be copied and nothing will be read from source file." -ForegroundColor "Yellow";
 	}
 }
 
@@ -262,7 +250,6 @@ $UnreadableBlocks = @();
 # Making filestreams
 $SourceStream = $SourceFile.OpenRead();
 $DestinationStream = $DestinationFile.OpenWrite();
-if ($PartialFilePath) {$PartialStream = $PartialFile.OpenRead();}
 
 if ($PositionEnd -le -1) {$PositionEnd = $SourceStream.Length}
 
@@ -273,34 +260,31 @@ Write-Host "Starting copying of $SourceFilePath..." -ForegroundColor "Green";
 
 while ($Position -lt $PositionEnd) {
 
-	if ($PartialFilePath -and
-		-not ($PositionMarkedAsBad = $PartialFileBadBlocks | % {if (($_.Offset -le $Position) -and ($Position -lt ($_.Offset + $_.Size))) {$true;}})) {
+	if (-not ($PositionMarkedAsBad = $DestinationFileBadBlocks | % {if (($_.Offset -le $Position) -and ($Position -lt ($_.Offset + $_.Size))) {$true;}})) {
 			
-			if (($DestinationStream.Position -eq 0) -or $LastReadFromSource) {Write-Host "Started reading from partial file at offset $Position." -ForegroundColor "DarkGreen";}
-			$LastReadFromSource = $false;
-			
-			# Read a block from partial file
-			$ReadLength = Force-Read -Stream $PartialStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries 0;
-			
-			assert $ReadSuccessful "Could not read byte $Position from partial file.";
+		if ($Position -eq 0 -or $LastReadFromSource) {Write-Host "Skipping from offset $Position." -ForegroundColor "DarkGreen";}
+		$LastReadFromSource = $false;
+		
+		# Skipping block.
+		$ReadLength = $BufferSize;
 			
 	} else {
 	
-			if (($DestinationStream.Position -eq 0) -or -not $LastReadFromSource) {Write-Host "Started reading from source file at offset $Position." -ForegroundColor "DarkRed";}
-			$LastReadFromSource = $true;
+		if (($Position -eq 0) -or -not $LastReadFromSource) {Write-Host "Started reading from source file at offset $Position." -ForegroundColor "DarkRed";}
+		$LastReadFromSource = $true;
 
-			# Force read a block from source
-			$ReadLength = Force-Read -Stream $SourceStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries $MaxRetries;		
-	
+		# Force read a block from source
+		$ReadLength = Force-Read -Stream $SourceStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries $MaxRetries;		
+
+		if (-not $ReadSuccessful) {
+			$UnreadableBlocks += New-Block -OffSet $Position -Size $ReadLength;
+		}
+			
+		# Write to destination file.
+		$DestinationStream.Position = $Position;
+		$DestinationStream.Write($Buffer, 0, $ReadLength);
+		
 	}
-	
-	if (-not $ReadSuccessful) {
-		$UnreadableBlocks += New-Block -OffSet $Position -Size $ReadLength;
-	}
-	
-	# Write to destination file.
-	$DestinationStream.Position = $Position;
-	$DestinationStream.Write($Buffer, 0, $ReadLength);
 	
 	$Position += $ReadLength; # adjust position
 	
@@ -309,16 +293,18 @@ while ($Position -lt $PositionEnd) {
 
 $SourceStream.Dispose();
 $DestinationStream.Dispose();
-if ($PartialFilePath) {$PartialStream.Dispose();}
 
 if ($UnreadableBlocks) {
 	
-	# Define local variables
-	$UnreadableBytes = ($UnreadableBlocks | Measure-Object -Sum -Property Size).Sum;
-	Write-Host "$($UnreadableBlocks | Measure-Object -Sum -Property Size).Sum) bytes are bad." -ForegroundColor "Magenta";
+	# Write summaryamount of bad blocks.
+	Write-Host "$(($UnreadableBlocks | Measure-Object -Sum -Property Size).Sum) bytes are bad." -ForegroundColor "Magenta";
 	
-	# Export bad blocks.
-	Export-Clixml -Path ($DestinationFilePath + '.badblocks.xml') -InputObject $UnreadableBlocks;
+	# Export badblocks.xml file.
+	Export-Clixml -Path ($DestinationFileBadBlocksPath) -InputObject $UnreadableBlocks;
+
+} elseif (Test-Path -LieralPath $DestinationFileBadBlocksPath) { # No unreadable blocks and badblocks.xml exists.
+	
+	Remove-Item -LiteralPath $DestinationFileBadBlocks;
 }
 
 # Set creation and modification times
