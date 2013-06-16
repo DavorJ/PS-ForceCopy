@@ -34,7 +34,15 @@
 ## .EXAMPLE
 ## dir '*.jpg' -recurse | foreach {.\Force-Copy.ps1 -SourceFilePath $_.FullName -DestinationFilePath ("C:\Saved"+(Split-Path $_.FullName -NoQualifier)) -Maxretries 2}
 ##
+## dir '*.jpg' -recurse | foreach {.\Force-Copy.ps1 -SourceFilePath $_.FullName -DestinationFilePath ("C:\Saved"+(Split-Path $_.FullName -NoQualifier)) -Maxretries 2 -Overwrite}
+##
 ## This command will copy all jpg's beginning with "Total" and copy them to "C:\Saved\relative_path" preserving their relative path.
+## When run the second time, the script will only try to reread the bad blocks in the source file, skipping data which as copied well in the previous run. This can be used to efficiently retry reading bad blocks.
+## 
+## .EXAMPLE
+## .\Force-Copy.ps1 -SourceFilePath "file_path_on_bad_disk" -DestinationFilePath "destinaton_path" -MaxRetries 6 -Position 1867264 -PositionEnd (1867264+4096)
+## 
+## Suppose you have a repairable rar file, which you tried to repair, and it reports you that the sector 3647 at offsets 1867264..1871360 can not be repaired. You still can try to read that specific sector with the above command.
 #########################
 
 [CmdletBinding()]
