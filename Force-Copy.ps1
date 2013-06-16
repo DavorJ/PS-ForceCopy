@@ -43,7 +43,11 @@ param(
    [Parameter(Mandatory=$true,
 			  ValueFromPipeline=$true,
 			  HelpMessage="Destination file path.")]
-   [string][ValidateScript({ -not (Test-Path -LiteralPath $_) })]$DestinationFilePath,
+   [string][ValidateScript({Test-Path -LiteralPath $_ -IsValid})]$DestinationFilePath,
+   [Parameter(Mandatory=$false,
+			  ValueFromPipeline=$true,
+			  HelpMessage="Path to the allready copied file with bad blocks.")]
+   [string][ValidateScript({(Test-Path -LiteralPath $_)})]$PartialFilePath,
    [Parameter(Mandatory=$false,
 			  ValueFromPipeline=$false,
 			  HelpMessage="Buffer size in bytes.")]
@@ -51,17 +55,130 @@ param(
    [Parameter(Mandatory=$false,
 			  ValueFromPipeline=$false,
 			  HelpMessage="Amount of tries.")]
-   [int16]$MaxRetries=0
+   [int16]$MaxRetries=0,
+   [Parameter(Mandatory=$false,
+			  ValueFromPipeline=$false,
+			  HelpMessage="Overwrite destination file?")]
+   [switch]$Overwrite=$false,
+   [Parameter(Mandatory=$false,
+			  ValueFromPipeline=$true,
+			  HelpMessage="Specify position from which to read block.")]
+   [int64]$Position=0,
+   [Parameter(Mandatory=$false,
+			  ValueFromPipeline=$true,
+			  HelpMessage="Specify end position for reading.")]
+   [int64]$PositionEnd=-1
 )
 
-Write-Host "Starting copy of $SourceFilePath..." -ForegroundColor "Green";
+# Set-StrictMode -Version 2;
 
-# Making buffer
-$Buffer = New-Object -TypeName System.Byte[] -ArgumentList $BufferSize;
-$FailCounter = 0;
+# Simple assert function from http://poshcode.org/1942
+function Assert {
+# Example
+# set-content C:\test2\Documents\test2 "hi"
+# C:\PS>assert { get-item C:\test2\Documents\test2 } "File wasn't created by Set-Content!"
+#
+[CmdletBinding()]
+param( 
+   [Parameter(Position=0,ParameterSetName="Script",Mandatory=$true)]
+   [ScriptBlock]$condition
+,
+   [Parameter(Position=0,ParameterSetName="Bool",Mandatory=$true)]
+   [bool]$success
+,
+   [Parameter(Position=1,Mandatory=$true)]
+   [string]$message
+)
 
-# Making container for storing missread offsets.
-$UnreadableBlocks = @();
+   $message = "ASSERT FAILED: $message"
+  
+   if($PSCmdlet.ParameterSetName -eq "Script") {
+      try {
+         $ErrorActionPreference = "STOP"
+         $success = &$condition
+      } catch {
+         $success = $false
+         $message = "$message`nEXCEPTION THROWN: $($_.Exception.GetType().FullName)"         
+      }
+   }
+   if(!$success) {
+      throw $message
+   }
+}
+
+# Forces read on Stream and returns total number of bytes read into buffer.
+function Force-Read() {
+param( 
+	[Parameter(Mandatory=$true)]
+	[System.IO.FileStream]$Stream,
+	[Parameter(Mandatory=$true)]
+	[int64]$Position,
+	[Parameter(Mandatory=$true)]
+	[ref]$Buffer,
+	[Parameter(Mandatory=$true)]
+	[ref]$Successful,
+	[Parameter(Mandatory=$false)]
+	[int16]$MaxRetries=0
+)
+
+	$Stream.Position = $Position;
+	$FailCounter = 0;
+	$Successful.Value = $false;
+
+	while (-not $Successful.Value) {
+	
+		try {
+			
+			$ReadLength = $Stream.Read($Buffer.Value, 0, $Buffer.Value.Length);
+			# If the read operation is successful, the current position of the stream is advanced by the number of bytes read. If an exception occurs, the current position of the stream is unchanged. (http://msdn.microsoft.com/en-us/library/system.io.filestream.read.aspx)
+			
+		} catch [System.IO.IOException] {
+			
+			$ShouldHaveReadSize = [math]::Min([int64] $Buffer.Value.Length, ($Stream.Length - $Stream.Position));
+			
+			if (++$FailCounter -le $MaxRetries) { # Retry to read block 
+			
+				Write-Host $FailCounter"th retry to read "$ShouldHaveReadSize" bytes starting at "$($Stream.Position)" bytes." -ForegroundColor "DarkYellow";
+				Write-Debug "Debugging read retry...";
+				
+				continue;
+			
+			} else { # Failed read of block.
+
+				Write-Host "Can not read"$ShouldHaveReadSize" bytes starting at "$($Stream.Position)" bytes: "$($_.Exception.message) -ForegroundColor "DarkRed";
+				Write-Debug "Debugging read failure...";
+				
+				# Should be here ONLY on UNsuccessful read!
+				# $Successful is $false by default;
+				$Buffer.Value = New-Object System.Byte[] ($Buffer.Value.Length);
+				return $ShouldHaveReadSize;
+			
+			}
+			
+		} catch {
+		
+			Write-Warning "Unhandled error at $($Stream.position) bit: $($_.Exception.message)";
+			Write-Debug "Unhandled error. You should debug."; 
+			
+			throw $_;
+		
+		}
+		
+		if ($FailCounter -gt 0) { # There were prior read failures
+			Write-Host "Successfully read"$ReadLength" bytes starting at "$($SourceStream.Position - $ReadLength)" bytes." -ForegroundColor "DarkGreen";
+		}
+		
+		# Should be here ONLY on successful read!
+		$Successful.Value = $true;
+		# Buffer is allready set during successful read.
+		return $ReadLength;
+
+	}
+
+	throw "Should not be here...";
+}
+
+# Returns a custom object for storing bad block data.
 function New-Block() { 
 	param ([int64] $OffSet, [int32] $Size)
 	  
@@ -73,75 +190,93 @@ function New-Block() {
 	return $block;
 }
 
-
-# Fetching source and destination files.
-$SourceFile = Get-Item -LiteralPath $SourceFilePath;
-$DestinationFile = New-Object System.IO.FileInfo ($DestinationFilePath);
-
-if (-not (Test-Path -LiteralPath ($DestinationParentFilePath = Split-Path -Path $DestinationFilePath -Parent) -PathType Container)) {
-	New-Item -ItemType Directory -Path $DestinationParentFilePath | Out-Null;
+# Snity checks
+if ((Test-Path -LiteralPath $DestinationFilePath) -and -not $Overwrite) {
+	Write-Host "Destination file $DestinationFilePath allready exists and -Overwrite not specified. Exiting script..." -ForegroundColor "Red";
+	exit 1;
 }
 
+# Fetching source file
+$SourceFile = Get-Item -LiteralPath $SourceFilePath;
+Assert {$Position -lt $SourceFile.length} "Specified position out of source file bounds.";
+
+# Fetching destination file.
+if (-not (Test-Path -LiteralPath ($DestinationParentFilePath = Split-Path -Path $DestinationFilePath -Parent) -PathType Container)) { # Make destination parent folder in case it doesn't exist.
+	New-Item -ItemType Directory -Path $DestinationParentFilePath | Out-Null;
+}
+$DestinationFile = New-Object System.IO.FileInfo ($DestinationFilePath); # Does not (!) physicaly make a file.
+if ($Overwrite -and (Test-Path -LiteralPath $DestinationFilePath)) {Assert {$SourceFile.Length -eq $DestinationFile.Length} "Source and destination file have not the same size!"} # Make sure the Source and Destination files have the same length prior to overwrite!
+
+# Fetching partial file.
+if ($PartialFilePath) {$PartialFile = Get-Item -LiteralPath $PartialFilePath; Assert {$SourceFile.Length -eq $PartialFile.Length} "Source and partial file have not the same size!";}
+
+# Fetching badblocks.xml from $PartialFile
+if ($PartialFilePath) {
+	if (Test-Path ($PartialFile.DirectoryName + '\' + $PartialFile.BaseName + '.badblocks.xml')) {
+		$PartialFileBadBlocks = Import-Clixml -Path ($PartialFile.DirectoryName + '\' + $PartialFile.BaseName + '.badblocks.xml');
+		Write-Host "Badblocks.xml successfully imported." -ForegroundColor "Green";
+		Assert {($PartialFileBadBlocks | Measure-Object -Average -Property Size).Average -eq $BufferSize } "Block sizes do not match between source and partial file. Can not continue." # This is currently an implementation shortcomming.
+	} else {
+		Write-Host "Partial file specified, but no badblocks.xml exists: partial file will be copied and nothing will be read from source file." -ForegroundColor "Yellow";
+	}
+}
+
+# Making buffer
+$Buffer = New-Object -TypeName System.Byte[] -ArgumentList $BufferSize;
+
+# Making container for storing missread offsets.
+$UnreadableBlocks = @();
+
+# Making filestreams
 $SourceStream = $SourceFile.OpenRead();
 $DestinationStream = $DestinationFile.OpenWrite();
+if ($PartialFilePath) {$PartialStream = $PartialFile.OpenRead();}
+
+if ($PositionEnd -le -1) {$PositionEnd = $SourceStream.Length}
 
 # Copying starts here
-while ($SourceStream.Position -lt $SourceStream.Length) {
-	try {
-		
-		$ReadLength = $SourceStream.Read($Buffer, 0, $Buffer.length);
-		# If the read operation is successful, the current position of the stream is advanced by the number of bytes read. If an exception occurs, the current position of the stream is unchanged. (http://msdn.microsoft.com/en-us/library/system.io.filestream.read.aspx)
-		
-	} catch [System.IO.IOException] {
-		
-		$ShouldHaveReadSize = [math]::Min([int64] $BufferSize, ($SourceStream.Length - $SourceStream.Position));
-		
-		if (++$FailCounter -le $MaxRetries) { # Retry to read block 
-		
-			Write-Host $FailCounter"th retry to read "$ShouldHaveReadSize" bytes starting at "$($SourceStream.Position)" bytes." -ForegroundColor "DarkYellow";
-			Write-Debug "Debugging read retry...";
-			
-			continue;
-		
-		} else { # Failed read of block.
-		
-			$FailCounter = 0; # reset fail counter;
-			
-			Write-Host "Can not read"$ShouldHaveReadSize" bytes starting at "$($SourceStream.Position)" bytes: "$($_.Exception.message) -ForegroundColor "DarkRed";
-			Write-Debug "Debugging read failure...";
-		
-			$DestinationStream.Write((New-Object System.Byte[] ($BufferSize)), 0, $ShouldHaveReadSize);
-		
-			$UnreadableBlocks += New-Block -OffSet $SourceStream.Position -Size $ShouldHaveReadSize;
+Write-Host "Starting copying of $SourceFilePath..." -ForegroundColor "Green";
 
-			$SourceStream.Position = $SourceStream.Position + $ShouldHaveReadSize;
-		
-			continue;
-		
-		}
-		
-	} catch {
+[bool] $ReadSuccessful = $false;
+
+while ($Position -lt $PositionEnd) {
+
+	if ($PartialFilePath -and
+		-not ($PositionMarkedAsBad = $PartialFileBadBlocks | % {if (($_.Offset -le $Position) -and ($Position -lt ($_.Offset + $_.Size))) {$true;}})) {
+			
+			if (($DestinationStream.Position -eq 0) -or $LastReadFromSource) {Write-Host "Started reading from partial file at offset $Position." -ForegroundColor "DarkGreen";}
+			$LastReadFromSource = $false;
+			
+			# Read a block from partial file
+			$ReadLength = Force-Read -Stream $PartialStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries 0;
+			
+			assert $ReadSuccessful "Could not read byte $Position from partial file.";
+			
+	} else {
 	
-		Write-Warning "Unhandled error at $($SourceStream.position) bit: $($_.Exception.message)";
-		Write-Debug "Unhandled error. You should debug."; 
-		
-		throw $_;
+			if (($DestinationStream.Position -eq 0) -or -not $LastReadFromSource) {Write-Host "Started reading from source file at offset $Position." -ForegroundColor "DarkRed";}
+			$LastReadFromSource = $true;
+
+			# Force read a block from source
+			$ReadLength = Force-Read -Stream $SourceStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries $MaxRetries;		
 	
 	}
-
-	# Read block successful
-	if ($FailCounter -gt 0) { # There were prior read failures
-		$FailCounter= 0; # reset fail counter;
-		Write-Host "Successfully read"$ReadLength" bytes starting at "$($SourceStream.Position - $ReadLength)" bytes." -ForegroundColor "DarkGreen";
+	
+	if (-not $ReadSuccessful) {
+		$UnreadableBlocks += New-Block -OffSet $Position -Size $ReadLength;
 	}
 	
-	
+	# Write to destination file.
+	$DestinationStream.Position = $Position;
 	$DestinationStream.Write($Buffer, 0, $ReadLength);
     # Write-Progress -Activity "Hashing File" -Status $file -percentComplete ($total/$fd.length * 100)
+	
+	$Position += $ReadLength; # adjust position
 }
 
 $SourceStream.Dispose();
 $DestinationStream.Dispose();
+if ($PartialFilePath) {$PartialStream.Dispose();}
 
 if ($UnreadableBlocks) {
 	
@@ -152,10 +287,11 @@ if ($UnreadableBlocks) {
 	Write-Host "$UnreadableBytes bytes are bad." -ForegroundColor "Magenta";
 		
 	# Rename the file so one knows there is bad data.
-	$DestinationFile.MoveTo($DestinationPathWithBadBlocks + $DestinationFile.Extension);
+	while ((Test-Path -LiteralPath ($TmpPath = $DestinationPathWithBadBlocks + ($suffix = if($i++) {"_$i"}) + $DestinationFile.Extension))) {}
+	$DestinationFile.MoveTo($DestinationPathWithBadBlocks + $suffix + $DestinationFile.Extension);
 	
 	# Export bad blocks.
-	Export-Clixml -Path ($DestinationPathWithBadBlocks + '.xml') -InputObject $UnreadableBlocks;
+	Export-Clixml -Path ($DestinationPathWithBadBlocks + $suffix + '.badblocks.xml') -InputObject $UnreadableBlocks;
 }
 
 # Set creation and modification times
