@@ -9,6 +9,9 @@
 ## .OUTPUTS
 #########################
 ## Errorcode 0: Copy operation finished without errors.
+## Errorcode 1: Copy operation finished with unreadable blocks.
+## Errorcode 2: Destination file exists, but -Overwrite not specified.
+## Errorcode 3: Destination file exists but has no bad blocks (i.e. no badblocks.xml file found)
 ## 
 ## .INPUTS
 #########################
@@ -67,7 +70,11 @@ param(
    [Parameter(Mandatory=$false,
 			  ValueFromPipeline=$true,
 			  HelpMessage="Specify end position for reading.")]
-   [int64]$PositionEnd=-1
+   [int64]$PositionEnd=-1,
+   [Parameter(Mandatory=$false,
+			  ValueFromPipeline=$false,
+			  HelpMessage="Ignore the existing badblocks.xml file?")]
+   [switch]$IgnoreBadBlocksFile=$false
 )
 
 # Set-StrictMode -Version 2;
@@ -192,22 +199,47 @@ function New-Block() {
 
 # Snity checks
 if ((Test-Path -LiteralPath $DestinationFilePath) -and -not $Overwrite) {
-	Write-Host "Destination file $DestinationFilePath allready exists and -Overwrite not specified. Exiting script..." -ForegroundColor "Red";
-	exit 1;
+	Write-Host "Destination file $DestinationFilePath allready exists and -Overwrite not specified. Exiting." -ForegroundColor "Red";
+	exit 2;
 }
 
-# Fetching source file
+# Fetching SOURCE file
 $SourceFile = Get-Item -LiteralPath $SourceFilePath;
 Assert {$Position -lt $SourceFile.length} "Specified position out of source file bounds.";
 
-# Fetching destination file.
+# Fetching DESTINATION file.
 if (-not (Test-Path -LiteralPath ($DestinationParentFilePath = Split-Path -Path $DestinationFilePath -Parent) -PathType Container)) { # Make destination parent folder in case it doesn't exist.
 	New-Item -ItemType Directory -Path $DestinationParentFilePath | Out-Null;
 }
 $DestinationFile = New-Object System.IO.FileInfo ($DestinationFilePath); # Does not (!) physicaly make a file.
-if ($Overwrite -and (Test-Path -LiteralPath $DestinationFilePath)) {Assert {$SourceFile.Length -eq $DestinationFile.Length} "Source and destination file have not the same size!"} # Make sure the Source and Destination files have the same length prior to overwrite!
+if ($Overwrite -and (Test-Path -LiteralPath $DestinationFilePath)) {
+	Assert {$SourceFile.Length -eq $DestinationFile.Length} "Source and destination file have not the same size!"  # Make sure the Source and Destination files have the same length prior to overwrite!
+	
+	if (-not $IgnoreBadBlocksFile) {
+		# Search for badblocks.xml - if it doesn't exist then the file is probably OK, so don't do anything!
+		if (-not (Test-Path ($DestinationFileBadBlocksPath = $DestinationFile.DirectoryName + '\' + $DestinationFile.Name + '.badblocks.xml'))) {
+			Write-Host "Destination file $DestinationFilePath has no bad blocks. It is unwise to continue... Exiting." -ForegroundColor "Red";
+			exit 3;
+		} else { # There is a $DestinationFileBadBlocksPath
+			$DestinationFileBadBlocks = Import-Clixml $DestinationFileBadBlocksPath;
+			
+			# Make sure destination file has bad blocks.
+			if ($DestinationFileBadBlocksPath.Length -eq 0) {
+				Write-Host "Destination file $DestinationFilePath has no bad blocks according to badblocks.xml. Should not overwrite... Exiting." -ForegroundColor "Red";
+				exit 3;
+			}
+			
+			foreach ($BadBlock in $DestinationFileBadBlocks) {
+				powershell -File """$($myinvocation.MyCommand.Definition)""" -SourceFilePath """$($SourceFilePath)""" -DestinationFilePath """$($DestinationFilePath)""" -Position $BadBlock.Offset -PositionEnd ($BadBlock.Offset + $BadBlock.Size) -Overwrite -IgnoreBadBlocksFile;
+				# ...
+				# Concept is niet zo goed... Wat als al dit hier gedaan is, verder executen, en hoe??
+			}
+			
+		}
+	}
+}
 
-# Fetching partial file.
+# Fetching PARTIAL file.
 if ($PartialFilePath) {$PartialFile = Get-Item -LiteralPath $PartialFilePath; Assert {$SourceFile.Length -eq $PartialFile.Length} "Source and partial file have not the same size!";}
 
 # Fetching badblocks.xml from $PartialFile
@@ -269,9 +301,10 @@ while ($Position -lt $PositionEnd) {
 	# Write to destination file.
 	$DestinationStream.Position = $Position;
 	$DestinationStream.Write($Buffer, 0, $ReadLength);
-    # Write-Progress -Activity "Hashing File" -Status $file -percentComplete ($total/$fd.length * 100)
 	
 	$Position += $ReadLength; # adjust position
+	
+	# Write-Progress -Activity "Hashing File" -Status $file -percentComplete ($total/$fd.length * 100)
 }
 
 $SourceStream.Dispose();
@@ -282,16 +315,10 @@ if ($UnreadableBlocks) {
 	
 	# Define local variables
 	$UnreadableBytes = ($UnreadableBlocks | Measure-Object -Sum -Property Size).Sum;
-	$DestinationPathWithBadBlocks = $DestinationFile.DirectoryName + '\' + $DestinationFile.BaseName + '_' + $UnreadableBytes + 'badbytes';
-	
-	Write-Host "$UnreadableBytes bytes are bad." -ForegroundColor "Magenta";
-		
-	# Rename the file so one knows there is bad data.
-	while ((Test-Path -LiteralPath ($TmpPath = $DestinationPathWithBadBlocks + ($suffix = if($i++) {"_$i"}) + $DestinationFile.Extension))) {}
-	$DestinationFile.MoveTo($DestinationPathWithBadBlocks + $suffix + $DestinationFile.Extension);
+	Write-Host "$($UnreadableBlocks | Measure-Object -Sum -Property Size).Sum) bytes are bad." -ForegroundColor "Magenta";
 	
 	# Export bad blocks.
-	Export-Clixml -Path ($DestinationPathWithBadBlocks + $suffix + '.badblocks.xml') -InputObject $UnreadableBlocks;
+	Export-Clixml -Path ($DestinationFilePath + '.badblocks.xml') -InputObject $UnreadableBlocks;
 }
 
 # Set creation and modification times
@@ -301,3 +328,9 @@ $DestinationFile.IsReadOnly = $SourceFile.IsReadOnly;
 
 Write-Host "Finished copying $SourceFilePath!" -ForegroundColor "Green";
 
+# Return specific code.
+if ($UnreadableBlocks) {
+	exit 5;
+} else {
+	exit 0;
+}
