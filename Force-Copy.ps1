@@ -70,7 +70,11 @@ param(
    [Parameter(Mandatory=$false,
 			  ValueFromPipeline=$false,
 			  HelpMessage="Ignore the existing badblocks.xml file?")]
-   [switch]$IgnoreBadBlocksFile=$false
+   [switch]$IgnoreBadBlocksFile=$false,   # not implemented
+   [Parameter(Mandatory=$false,
+			  ValueFromPipeline=$false,
+			  HelpMessage="Will the source file be deleted in case no bad blocks are encountered?")]
+   [switch]$DeleteSourceOnSuccess=$false
 )
 
 Set-StrictMode -Version 2;
@@ -202,6 +206,7 @@ Assert {$Position -eq 0 -and $PositionEnd -eq -1} "Current limitation: Position 
 
 # Setting global variables
 $DestinationFileBadBlocksPath = $DestinationFilePath + '.badblocks.xml';
+$DestinationFileBadBlocks = @();
 
 # Fetching SOURCE file
 $SourceFile = Get-Item -LiteralPath $SourceFilePath;
@@ -212,6 +217,7 @@ if (-not (Test-Path -LiteralPath ($DestinationParentFilePath = Split-Path -Path 
 	New-Item -ItemType Directory -Path $DestinationParentFilePath | Out-Null;
 }
 $DestinationFile = New-Object System.IO.FileInfo ($DestinationFilePath); # Does not (!) physicaly make a file.
+$NewDestinationFile = -not $DestinationFile.Exists;
 
 # Special handling for DESTINATION file in case OVERWRITE is used! Only bad block are read from source!
 if ($Overwrite -and (Test-Path -LiteralPath $DestinationFilePath)) {
@@ -260,29 +266,30 @@ Write-Host "Starting copying of $SourceFilePath..." -ForegroundColor "Green";
 
 while ($Position -lt $PositionEnd) {
 
-	if (-not ($PositionMarkedAsBad = $DestinationFileBadBlocks | % {if (($_.Offset -le $Position) -and ($Position -lt ($_.Offset + $_.Size))) {$true;}})) {
+	if ($NewDestinationFile -or 
+	   ($PositionMarkedAsBad = $DestinationFileBadBlocks | % {if (($_.Offset -le $Position) -and ($Position -lt ($_.Offset + $_.Size))) {$true;}})) {
 			
-		if ($Position -eq 0 -or $LastReadFromSource) {Write-Host "Skipping from offset $Position." -ForegroundColor "DarkGreen";}
-		$LastReadFromSource = $false;
-		
-		# Skipping block.
-		$ReadLength = $BufferSize;
+			if (($Position -eq 0) -or -not $LastReadFromSource) {Write-Host "Started reading from source file at offset $Position." -ForegroundColor "DarkRed";}
+			$LastReadFromSource = $true;
+
+			# Force read a block from source
+			$ReadLength = Force-Read -Stream $SourceStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries $MaxRetries;		
+
+			if (-not $ReadSuccessful) {
+				$UnreadableBlocks += New-Block -OffSet $Position -Size $ReadLength;
+			}
+				
+			# Write to destination file.
+			$DestinationStream.Position = $Position;
+			$DestinationStream.Write($Buffer, 0, $ReadLength);
 			
 	} else {
 	
-		if (($Position -eq 0) -or -not $LastReadFromSource) {Write-Host "Started reading from source file at offset $Position." -ForegroundColor "DarkRed";}
-		$LastReadFromSource = $true;
-
-		# Force read a block from source
-		$ReadLength = Force-Read -Stream $SourceStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries $MaxRetries;		
-
-		if (-not $ReadSuccessful) {
-			$UnreadableBlocks += New-Block -OffSet $Position -Size $ReadLength;
-		}
+			if ($Position -eq 0 -or $LastReadFromSource) {Write-Host "Skipping from offset $Position." -ForegroundColor "DarkGreen";}
+			$LastReadFromSource = $false;
 			
-		# Write to destination file.
-		$DestinationStream.Position = $Position;
-		$DestinationStream.Write($Buffer, 0, $ReadLength);
+			# Skipping block.
+			$ReadLength = $BufferSize;
 		
 	}
 	
@@ -302,7 +309,7 @@ if ($UnreadableBlocks) {
 	# Export badblocks.xml file.
 	Export-Clixml -Path ($DestinationFileBadBlocksPath) -InputObject $UnreadableBlocks;
 
-} elseif (Test-Path -LieralPath $DestinationFileBadBlocksPath) { # No unreadable blocks and badblocks.xml exists.
+} elseif (Test-Path -LiteralPath $DestinationFileBadBlocksPath) { # No unreadable blocks and badblocks.xml exists.
 	
 	Remove-Item -LiteralPath $DestinationFileBadBlocks;
 }
@@ -316,7 +323,7 @@ Write-Host "Finished copying $SourceFilePath!" -ForegroundColor "Green";
 
 # Return specific code.
 if ($UnreadableBlocks) {
-	exit 5;
+	exit 1;
 } else {
 	exit 0;
 }
