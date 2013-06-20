@@ -12,6 +12,7 @@
 ## Errorcode 1: Copy operation finished with unreadable blocks.
 ## Errorcode 2: Destination file exists, but -Overwrite not specified.
 ## Errorcode 3: Destination file exists but has no bad blocks (i.e. no badblocks.xml file found)
+## Errorcode 4: Destination file can not be written to.
 ## 
 ## .INPUTS
 #########################
@@ -264,6 +265,7 @@ $UnreadableBlocks = @();
 # Making filestreams
 $SourceStream = $SourceFile.OpenRead();
 $DestinationStream = $DestinationFile.OpenWrite();
+if (-not $?) {exit 4;}
 
 if ($PositionEnd -le -1) {$PositionEnd = $SourceStream.Length}
 
@@ -319,7 +321,7 @@ if ($UnreadableBlocks) {
 
 } elseif (Test-Path -LiteralPath $DestinationFileBadBlocksPath) { # No unreadable blocks and badblocks.xml exists.
 	
-	Remove-Item -LiteralPath $DestinationFileBadBlocks;
+	Remove-Item -LiteralPath $DestinationFileBadBlocksPath;
 }
 
 # Set creation and modification times
