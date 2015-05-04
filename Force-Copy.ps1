@@ -44,6 +44,11 @@
 ## .\Force-Copy.ps1 -SourceFilePath "file_path_on_bad_disk" -DestinationFilePath "destinaton_path" -MaxRetries 6 -Position 1867264 -PositionEnd (1867264+4096)
 ## 
 ## Suppose you have a repairable rar file, which you tried to repair, and it reports you that the sector 3647 at offsets 1867264..1871360 can not be repaired. You still can try to read that specific sector with the above command.
+##
+## .EXAMPLE
+## .\Force-Copy.ps1 -SourceFilePath "file_path_on_bad_disk" -DestinationFilePath "destinaton_path" -MaxRetries 6 -BufferSize 33554432 -BufferGranularSize 4096
+## 
+## This will quickly copy the file using a 32 MB buffer, and if it encounters an error, it will retry using a 4K buffer (so you get the best of both worlds, performance of a large buffer, and the minimized data loss of a smaller buffer)
 #########################
 
 [CmdletBinding()]
@@ -84,6 +89,10 @@ param(
 			  ValueFromPipeline=$false,
 			  HelpMessage="Will the source file be deleted in case no bad blocks are encountered?")]
    [switch]$DeleteSourceOnSuccess=$false,
+   [Parameter(Mandatory=$false,
+			  ValueFromPipeline=$false,
+			  HelpMessage="Failback granular buffer size. Set BufferSize to a large value for speed, but revert to using a BufferGranularSize buffer when there is a read error.")]
+   [int32]$BufferGranularSize=-1, # If > 0, use a larger buffer for speed, and only revert to granular size on an error block. Should be and exact divisor of buffer (BufferSize should be a multiple of BufferGranularSize)
    [Parameter(Mandatory=$false,
 			  ValueFromPipeline=$true,
 			  HelpMessage="Write-Progress Bar Parent Id.")]
@@ -237,7 +246,11 @@ if ((Test-Path -LiteralPath $DestinationFilePath) -and -not $Overwrite) {
 	Write-Host "Destination file $DestinationFilePath allready exists and -Overwrite not specified. Exiting." -ForegroundColor "Red";
 	exit 2;
 }
-Assert {$Position -eq 0 -and $PositionEnd -eq -1} "Current limitation: Position and POsitionEnd should be 0 and -1 respectively.";
+Assert {$Position -eq 0 -and $PositionEnd -eq -1} "Current limitation: Position and PositionEnd should be 0 and -1 respectively.";
+
+if ($BufferGranularSize -gt 0) {
+    Assert {(($BufferSize % $BufferGranularSize) -eq 0) -and ($BufferSize -gt $BufferGranularSize)} "BufferSize must be larger and divisible by BufferGranularSize.";
+}
 
 # Setting global variables
 $DestinationFileBadBlocksPath = $DestinationFilePath + '.badblocks.xml';
@@ -277,6 +290,7 @@ if ($Overwrite -and (Test-Path -LiteralPath $DestinationFilePath)) {
 			exit 3;
 		}	
 	
+        # When using $BufferGranularSize (or other gradual retry logic), it could be writting different size blocks to badblocks file. What would be the implications if it did?
 		Assert {($DestinationFileBadBlocks | Measure-Object -Average -Property Size).Average -eq $BufferSize } "Block sizes do not match between source and destination file. Can not continue." # This is currently an implementation shortcomming.
 			
 	}
@@ -340,16 +354,93 @@ while ($Position -lt $PositionEnd) {
 			if (($Position -eq 0) -or -not $LastReadFromSource) {Write-Host "Started reading from source file at offset $Position." -ForegroundColor "DarkRed";}
 			$LastReadFromSource = $true;
 
-			# Force read a block from source
-			$ReadLength = Force-Read -Stream $SourceStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries $MaxRetries;		
+            [bool] $GranularLogicUsed = $false;
 
-			if (-not $ReadSuccessful) {
-				$UnreadableBlocks += New-Block  -OffSet $Position -Size $ReadLength;
-			}
+			# Force read a block from source
+            if (($BufferGranularSize -gt 0) -and ($MaxRetries -gt 0) ) {
+                # Try once w/o retries
+                $ReadLength = Force-Read -Stream $SourceStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries 0;
+                
+                # If failed, then go again retrying with smaller buffer
+    			if (-not $ReadSuccessful) {
+                    # Granular logic could probably use more testing (extreme cases, like error in last block of file).
+                    # Maybe try and use Holodeck (now open source), see http://stackoverflow.com/questions/4430591/simulating-file-errors-e-g-error-access-denied-on-windows
+
+                    # Flag we are switched to smaller buffer (so it doesn't write to output in outer if)
+                    $GranularLogicUsed = $true;
+
+                    # Better way to log it, actually granular? Or just ignore the outer buffer size for badblocks purposes (it's unlikely that people will be mixing versions of the script with prior badblock with different sizes)
+				    # $UnreadableBlocks += New-Block  -OffSet $Position -Size $ReadLength;
+
+                    Write-Host "Switching to granular logic at $Position." -ForegroundColor "DarkGreen";
+
+                    # Allocate granular buffer
+                    $GranularBuffer = New-Object -TypeName System.Byte[] -ArgumentList $BufferGranularSize;
+
+                    # Could probably try and refactor with outer loop (and/or refactor conditional), but it could be error prone. For now better duplicate some of the outer loop logic with local variables
+                    # Could also try and do it inside Force-Read (and might be more elegant), but that might have other issues
+                    # Maybe better yet, could refactor into a recursive version, so it would gradually lower the granular buffer size, so it doesn't loose all the speed when it hits an error
+                    [int64] $GranularPosition = $Position;
+                    [int64] $GranularLastPosition = [math]::Min([int64] $Position + $BufferSize, $PositionEnd);
+                    [int64] $GranularReadLength = -1;
+                    [int64] $GranularReadLengthTotal = 0;
+                    [bool] $GranularReadSuccessful = $false;
+
+                    while ($GranularPosition -lt $GranularLastPosition) {
+                        # Update progress report
+                        if( ($LatestReportedAt + $ReportEvery) -le $sw.Elapsed) {
+                            if( ($LatestThroughputReportedAt + $ThroughputRefreshEvery) -le $sw.Elapsed) {
+                                $ThroughputLast = [math]::Round(($GranularPosition - $ThroughputLastPosition) / 1024 / 1024 / ($sw.Elapsed - $LatestThroughputReportedAt).TotalSeconds, 2);
+                                $LatestThroughputReportedAt = $sw.Elapsed;
+                                $ThroughputLastPosition = $GranularPosition;
+                            }
+
+                            Force-Copy-ProgressReport -Position $GranularPosition -PositionEnd $PositionEnd  -LatestThroughput $ThroughputLast `
+                                -DetailedStatus "Granular reading $BufferGranularSize bytes block at position $GranularPosition"
+
+                            $LatestReportedAt = $sw.Elapsed;
+                            $ReportEvery = $ReportWaitAfterward;
+                        }
+
+                        $GranularReadLength = Force-Read -Stream $SourceStream -Position $GranularPosition -Buffer ([ref] $GranularBuffer) -Successful ([ref] $GranularReadSuccessful) -MaxRetries ($MaxRetries);
+
+                        if (-not $GranularReadSuccessful) {
+                            $GranularOverallBadSizeTotal += $GranularReadLength;
+                        }
+
+                        # Here we could log a more granular version of badblocks
+                        $UnreadableBlocks += New-Block  -OffSet $GranularPosition -Size $GranularReadLength;
+
+			            # Write to destination file.
+			            $DestinationStream.Position = $GranularPosition;
+    		            $DestinationStream.Write($GranularBuffer, 0, $GranularReadLength);
+
+                        $GranularPosition += $GranularReadLength;
+                        $GranularReadLengthTotal += $GranularReadLength;
+                    }
+
+                    $ReadLength = $GranularReadLengthTotal;
+
+                    # Does it need an escape clause like $LastReadFromSource (see below)
+                }
+
+            } else {
+                
+                # Original logic w/o granular buffer
+			    $ReadLength = Force-Read -Stream $SourceStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries $MaxRetries;		
+
+            }
+
+            if (-not $GranularLogicUsed) {
+			    if (-not $ReadSuccessful) {
+				    $UnreadableBlocks += New-Block  -OffSet $Position -Size $ReadLength;
+			    }
 				
-			# Write to destination file.
-			$DestinationStream.Position = $Position;
-			$DestinationStream.Write($Buffer, 0, $ReadLength);
+			    # Write to destination file.
+			    $DestinationStream.Position = $Position;
+    		    $DestinationStream.Write($Buffer, 0, $ReadLength);
+            }
+
 			
 	} else {
 	
@@ -373,7 +464,11 @@ $sw.Stop();
 if ($UnreadableBlocks) {
 	
 	# Write summaryamount of bad blocks.
-	Write-Host "$(($UnreadableBlocks | Measure-Object -Sum -Property Size).Sum) bytes are bad." -ForegroundColor "Magenta";
+    if ($BufferGranularSize -gt 0) {
+	    Write-Host "Up to $GranularOverallBadSizeTotal bytes are bad." -ForegroundColor "Magenta";
+    } else {
+	    Write-Host "$(($UnreadableBlocks | Measure-Object -Sum -Property Size).Sum) bytes are bad." -ForegroundColor "Magenta";
+    }
 	
 	# Export badblocks.xml file.
 	Export-Clixml -Path ($DestinationFileBadBlocksPath) -InputObject $UnreadableBlocks;
