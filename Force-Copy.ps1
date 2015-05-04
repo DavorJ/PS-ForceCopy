@@ -83,7 +83,11 @@ param(
    [Parameter(Mandatory=$false,
 			  ValueFromPipeline=$false,
 			  HelpMessage="Will the source file be deleted in case no bad blocks are encountered?")]
-   [switch]$DeleteSourceOnSuccess=$false
+   [switch]$DeleteSourceOnSuccess=$false,
+   [Parameter(Mandatory=$false,
+			  ValueFromPipeline=$true,
+			  HelpMessage="Write-Progress Bar Parent Id.")]
+   [int32]$ProgressParentId=-1
 )
 
 Set-StrictMode -Version 2;
@@ -206,6 +210,28 @@ function New-Block() {
 	return $block;
 }
 
+function Force-Copy-ProgressReport (){
+param (
+	[Parameter(Mandatory=$true)]
+	[int64]$Position,
+	[Parameter(Mandatory=$true)]
+	[int64]$PositionEnd,
+    [Parameter(Mandatory=$true)]
+    [string] $LatestThroughput,
+    [Parameter(Mandatory=$true)]
+    [string] $DetailedStatus
+)
+
+    # Report total percent done
+    [float] $CurrProgress = $Position/$PositionEnd * 100;
+    [string] $fName = (Split-Path $SourceFilePath -Leaf)
+    [string] $fPath = (Split-Path $SourceFilePath -Parent)
+	Write-Progress -Activity "Force-Copy" -Status "Copying $fName ($LatestThroughput MB/s) from $fPath" -percentComplete ($CurrProgress) -CurrentOperation $DetailedStatus -ParentId $ProgressParentId;
+
+    # Report block being read (only every so often, to avoid flicker and wasted processing)
+	# Write-Progress -Id 1 -Activity "Force-Copy" -Status $DetailedStatus -percentComplete (-1);
+}
+
 # Snity checks
 if ((Test-Path -LiteralPath $DestinationFilePath) -and -not $Overwrite) {
 	Write-Host "Destination file $DestinationFilePath allready exists and -Overwrite not specified. Exiting." -ForegroundColor "Red";
@@ -267,6 +293,18 @@ $SourceStream = $SourceFile.OpenRead();
 $DestinationStream = $DestinationFile.OpenWrite();
 if (-not $?) {exit 4;}
 
+# Measure time between progress reports to avoid wasting resources (and adding wait times for the UI to redraw)
+[TimeSpan] $ReportEvery = New-TimeSpan -Seconds 10; # Wait 10 seconds before first report, then every 3
+[TimeSpan] $ReportWaitAfterward = New-TimeSpan -Seconds 3; # Update every 3 seconds after first report
+[TimeSpan] $ThroughputRefreshEvery = $ReportEvery - (New-TimeSpan -Seconds 2); # Wait 8+ seconds to recalculate throuput
+[Diagnostics.Stopwatch] $sw = [Diagnostics.Stopwatch]::StartNew();
+[TimeSpan] $LatestReportedAt = $sw.Elapsed;
+[TimeSpan] $LatestThroughputReportedAt = $LatestReportedAt;
+[int64] $InitialPosition = $Position # Remember initial $Position value (before it is changed during iterations) for final throughput calc
+[int64] $ThroughputLastPosition = $Position; # Initial position to calculate throughput
+[float] $ThroughputLast = 0; # MB/s throughput as of last refresh
+[int64] $GranularOverallBadSizeTotal = 0;
+
 if ($PositionEnd -le -1) {$PositionEnd = $SourceStream.Length}
 
 # Copying starts here
@@ -275,6 +313,26 @@ Write-Host "Starting copying of $SourceFilePath..." -ForegroundColor "Green";
 [bool] $ReadSuccessful = $false;
 
 while ($Position -lt $PositionEnd) {
+
+    # Report progress so far
+    # Only report every so often, to avoid flicker and wasted processing/wait times
+    if( ($LatestReportedAt + $ReportEvery) -le $sw.Elapsed) {
+
+        # Update throughput calculation
+        if( ($LatestThroughputReportedAt + $ThroughputRefreshEvery) -le $sw.Elapsed) {
+            $ThroughputLast = [math]::Round(($Position - $ThroughputLastPosition) / 1024 / 1024 / ($sw.Elapsed - $LatestThroughputReportedAt).TotalSeconds, 2);
+            $LatestThroughputReportedAt = $sw.Elapsed;
+            $ThroughputLastPosition = $Position;
+        }
+
+        # Update progress bar(s)
+        Force-Copy-ProgressReport -Position $Position -PositionEnd $PositionEnd -LatestThroughput $ThroughputLast `
+            -DetailedStatus "Reading block ($BufferSize bytes) at position $Position" 
+
+        # Update interval variables
+        $LatestReportedAt = $sw.Elapsed;
+        $ReportEvery = $ReportWaitAfterward; # Switch to 3 seconds after the initial wait
+    }
 
 	if ($NewDestinationFile -or 
 	   ($PositionMarkedAsBad = $DestinationFileBadBlocks | % {if (($_.Offset -le $Position) -and ($Position -lt ($_.Offset + $_.Size))) {$true;}})) {
@@ -286,7 +344,7 @@ while ($Position -lt $PositionEnd) {
 			$ReadLength = Force-Read -Stream $SourceStream -Position $Position -Buffer ([ref] $Buffer) -Successful ([ref] $ReadSuccessful) -MaxRetries $MaxRetries;		
 
 			if (-not $ReadSuccessful) {
-				$UnreadableBlocks += New-Block -OffSet $Position -Size $ReadLength;
+				$UnreadableBlocks += New-Block  -OffSet $Position -Size $ReadLength;
 			}
 				
 			# Write to destination file.
@@ -304,12 +362,13 @@ while ($Position -lt $PositionEnd) {
 	}
 	
 	$Position += $ReadLength; # adjust position
-	
-	# Write-Progress -Activity "Hashing File" -Status $file -percentComplete ($total/$fd.length * 100)
+
 }
 
 $SourceStream.Dispose();
 $DestinationStream.Dispose();
+
+$sw.Stop();
 
 if ($UnreadableBlocks) {
 	
@@ -329,6 +388,9 @@ $DestinationFile.CreationTimeUtc = $SourceFile.CreationTimeUtc;
 $DestinationFile.LastWriteTimeUtc = $SourceFile.LastWriteTimeUtc;
 $DestinationFile.IsReadOnly = $SourceFile.IsReadOnly;
 
+[string] $FinalTimeStr = $sw.Elapsed.ToString();
+[float] $ThroughputMBperS = [math]::Round( ($PositionEnd - $InitialPosition) / 1024 / 1024 / $sw.Elapsed.TotalSeconds, 2);
+Write-Host "Copied $PositionEnd bytes in $FinalTimeStr ($ThroughputMBperS MB/s)" -ForegroundColor "Green";
 Write-Host "Finished copying $SourceFilePath!`n" -ForegroundColor "Green";
 
 # Return specific code.
