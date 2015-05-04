@@ -319,6 +319,18 @@ if (-not $?) {exit 4;}
 [float] $ThroughputLast = 0; # MB/s throughput as of last refresh
 [int64] $GranularOverallBadSizeTotal = 0;
 
+# Measure time between progress reports to avoid wasting resources (and adding wait times for the UI to redraw)
+[TimeSpan] $ReportEvery = New-TimeSpan -Seconds 10; # Wait 10 seconds before first report, then every 3
+[TimeSpan] $ReportWaitAfterward = New-TimeSpan -Seconds 3; # Update every 3 seconds after first report
+[TimeSpan] $ThroughputRefreshEvery = $ReportEvery - (New-TimeSpan -Seconds 2); # Wait 8+ seconds to recalculate throuput
+[Diagnostics.Stopwatch] $sw = [Diagnostics.Stopwatch]::StartNew();
+[TimeSpan] $LatestReportedAt = $sw.Elapsed;
+[TimeSpan] $LatestThroughputReportedAt = $LatestReportedAt;
+[int64] $InitialPosition = $Position # Remember initial $Position value (before it is changed during iterations) for final throughput calc
+[int64] $ThroughputLastPosition = $Position; # Initial position to calculate throughput
+[float] $ThroughputLast = 0; # MB/s throughput as of last refresh
+[int64] $GranularOverallBadSizeTotal = 0;
+
 if ($PositionEnd -le -1) {$PositionEnd = $SourceStream.Length}
 
 # Copying starts here
