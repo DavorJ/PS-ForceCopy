@@ -4,14 +4,14 @@
 ##
 ## .DESCRIPTION
 #########################
-## This script will copy the specified file even if it contains unreadable blocks caused by device I/O errors and such. The block that it can not read will be replaced with zeros. The size of the block is determined by the buffer. So, to optimize it for speed, use a large buffer. T optimize fo accuracy, use small buffer, smallest being the cluter size of the partition where your sourcefile resides.
+## This script will copy the specified file even if it contains unreadable blocks caused by device I/O errors and such. The block that it can not read will be replaced with zeros. The size of the block is determined by the buffer. So, to optimize it for speed, use a large buffer. To optimize for accuracy, use a small buffer, smallest being the cluter size of the partition where your sourcefile resides.
 ##
 ## .OUTPUTS
 #########################
 ## Errorcode 0: Copy operation finished without errors.
 ## Errorcode 1: Copy operation finished with unreadable blocks.
 ## Errorcode 2: Destination file exists, but -Overwrite not specified.
-## Errorcode 3: Destination file exists but has no bad blocks (i.e. no badblocks.xml file found)
+## Errorcode 3: Destination file exists but has no bad blocks (i.e. no badblocks.xml file found).
 ## Errorcode 4: Destination file can not be written to.
 ## 
 ## .INPUTS
@@ -25,7 +25,7 @@
 ## Path to the destination file.
 ## 
 ## .PARAMETER Buffer
-## I makes absolutely no sense to set this less than the cluser size of the partition. Setting it lower than cluster size might force rereading a bad sector in a cluster multiple times. Better is to adjust the retry option. Also, System.IO.FileStream buffers input and output for better performance. (http://msdn.microsoft.com/en-us/library/system.io.filestream.aspx).
+## It makes absolutely no sense to set this less than the cluser size of the partition. Setting it lower than cluster size might force rereading a bad sector in a cluster multiple times. Better is to adjust the retry option. Also, System.IO.FileStream buffers input and output for better performance. (https://docs.microsoft.com/en-us/dotnet/api/system.io.filestream).
 ##
 ## .EXAMPLE
 ## .\Force-Copy.ps1 -SourceFilePath "file_path_on_bad_disk" -DestinationFilePath "destinaton_path" -MaxRetries 6
@@ -38,17 +38,17 @@
 ## dir '*.jpg' -recurse | foreach {.\Force-Copy.ps1 -SourceFilePath $_.FullName -DestinationFilePath ("C:\Saved"+(Split-Path $_.FullName -NoQualifier)) -Maxretries 2 -Overwrite}
 ##
 ## This command will copy all jpg's beginning with "Total" and copy them to "C:\Saved\relative_path" preserving their relative path.
-## When run the second time, the script will only try to reread the bad blocks in the source file, skipping data which as copied well in the previous run. This can be used to efficiently retry reading bad blocks.
+## When run the second time, the script will only try to reread the bad blocks in the source file, skipping data which was copied well in the previous run. This can be used to efficiently retry reading bad blocks.
 ## 
 ## .EXAMPLE
 ## .\Force-Copy.ps1 -SourceFilePath "file_path_on_bad_disk" -DestinationFilePath "destinaton_path" -MaxRetries 6 -Position 1867264 -PositionEnd (1867264+4096)
 ## 
-## Suppose you have a repairable rar file, which you tried to repair, and it reports you that the sector 3647 at offsets 1867264..1871360 can not be repaired. You still can try to read that specific sector with the above command.
+## Suppose you have a repairable rar file, which you tried to repair, and it reports that the sector 3647 at offsets 1867264..1871360 can not be repaired. You can still try to read that specific sector with the above command.
 ##
 ## .EXAMPLE
 ## .\Force-Copy.ps1 -SourceFilePath "file_path_on_bad_disk" -DestinationFilePath "destinaton_path" -MaxRetries 6 -BufferSize 33554432 -BufferGranularSize 4096
 ## 
-## This will quickly copy the file using a 32 MB buffer, and if it encounters an error, it will retry using a 4K buffer (so you get the best of both worlds, performance of a large buffer, and the minimized data loss of a smaller buffer)
+## This will quickly copy the file using a 32 MB buffer, and if it encounters an error, it will retry using a 4K buffer (so you get the best of both worlds, performance of a large buffer, and the minimized data loss of a smaller buffer).
 #########################
 
 [CmdletBinding()]
