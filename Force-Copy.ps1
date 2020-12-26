@@ -33,9 +33,9 @@
 ## This will copy file_path_on_bad_disk to destinaton_path with maximum of 6 retries on each cluster of 4096 bytes encountered. Usually 6 retries is enough to succeed, unless the sector is really completely unreadable. 
 ##
 ## .EXAMPLE
-## dir '*.jpg' -recurse | foreach {.\Force-Copy.ps1 -SourceFilePath $_.FullName -DestinationFilePath ("C:\Saved"+(Split-Path $_.FullName -NoQualifier)) -Maxretries 2}
+## Get-ChildItem '*.jpg' -Recurse -File -Force | foreach {.\Force-Copy.ps1 -SourceFilePath $_.FullName -DestinationFilePath ("C:\Saved"+(Split-Path $_.FullName -NoQualifier)) -Maxretries 2}
 ##
-## dir '*.jpg' -recurse | foreach {.\Force-Copy.ps1 -SourceFilePath $_.FullName -DestinationFilePath ("C:\Saved"+(Split-Path $_.FullName -NoQualifier)) -Maxretries 2 -Overwrite}
+## Get-ChildItem '*.jpg' -Recurse -File -Force | foreach {.\Force-Copy.ps1 -SourceFilePath $_.FullName -DestinationFilePath ("C:\Saved"+(Split-Path $_.FullName -NoQualifier)) -Maxretries 2 -Overwrite}
 ##
 ## This command will copy all jpg's beginning with "Total" and copy them to "C:\Saved\relative_path" preserving their relative path.
 ## When run the second time, the script will only try to reread the bad blocks in the source file, skipping data which was copied well in the previous run. This can be used to efficiently retry reading bad blocks.
@@ -483,7 +483,7 @@ if ($UnreadableBlocks) {
     }
 	
 	# Export badblocks.xml file.
-	Export-Clixml -Path ($DestinationFileBadBlocksPath) -InputObject $UnreadableBlocks;
+	Export-Clixml -LiteralPath ($DestinationFileBadBlocksPath) -InputObject $UnreadableBlocks;
 
 } elseif (Test-Path -LiteralPath $DestinationFileBadBlocksPath) { # No unreadable blocks and badblocks.xml exists.
 	
